@@ -100,6 +100,94 @@ class MatmulOp(BaseOp):
   def es_shape(self):
     return {"i": self.ni, "j": self.nj, "k": self.nk}
 
+def _abc_shape(es_str, es_shape):
+  modes = sorted(set(c for c in es_str if c.isalpha()))
+  if len(modes) != len(es_shape):
+    raise ValueError("abc str fail")
+  return {k: v for k, v in zip(modes, es_shape)}
+
+class Contraction(BaseOp):
+  def __init__(self, abc_str, abc_shape):
+    self._es_str   = abc_str
+    self._es_shape = _abc_shape(abc_str, abc_shape)
+  def es_str(self):
+    return self._es_str
+  def es_shape(self):
+    return self._es_shape
+
+def _unary_ew_str_shape(shape):
+  m = "abcdefghijklmnopqrstuvwxyz"[:len(shape)]
+  return m + "->" + m, {k: v for k, v in zip(m, shape)}
+
+class Scale(BaseOp):
+  def __init__(self, shape):
+    self._es_str, self._es_shape = _unary_ew_str_shape(shape)
+  def es_str(self):
+    return self._es_str
+  def es_shape(self):
+    return self._es_shape
+
+class Exp(BaseOp):
+  def __init__(self, shape):
+    self._es_str, self._es_shape = _unary_ew_str_shape(shape)
+  def es_str(self):
+    return self._es_str
+  def es_shape(self):
+    return self._es_shape
+
+class Relu(BaseOp):
+  def __init__(self, shape):
+    self._es_str, self._es_shape = _unary_ew_str_shape(shape)
+  def es_str(self):
+    return self._es_str
+  def es_shape(self):
+    return self._es_shape
+
+class Maximum(BaseOp):
+  def __init__(self, abc_str, abc_shape):
+    self._es_str   = abc_str
+    self._es_shape = _abc_shape(abc_str, abc_shape)
+  def es_str(self):
+    return self._es_str
+  def es_shape(self):
+    return self._es_shape
+
+class Subtract(BaseOp):
+  def __init__(self, abc_str, abc_shape):
+    self._es_str   = abc_str
+    self._es_shape = _abc_shape(abc_str, abc_shape)
+  def es_str(self):
+    return self._es_str
+  def es_shape(self):
+    return self._es_shape
+
+class Reduction(BaseOp):
+  def __init__(self, abc_str, abc_shape):
+    self._es_str   = abc_str
+    self._es_shape = _abc_shape(abc_str, abc_shape)
+  def es_str(self):
+    return self._es_str
+  def es_shape(self):
+    return self._es_shape
+
+class Division(BaseOp):
+  def __init__(self, abc_str, abc_shape):
+    self._es_str   = abc_str
+    self._es_shape = _abc_shape(abc_str, abc_shape)
+  def es_str(self):
+    return self._es_str
+  def es_shape(self):
+    return self._es_shape
+
+class Add(BaseOp):
+  def __init__(self, abc_str, abc_shape):
+    self._es_str   = abc_str
+    self._es_shape = _abc_shape(abc_str, abc_shape)
+  def es_str(self):
+    return self._es_str
+  def es_shape(self):
+    return self._es_shape
+
 class InputOp(BaseOp):
   def __init__(self, shape):
     self.shape = shape
@@ -150,3 +238,6 @@ class Node:
       ret.append(mapping)
     return list(map(frozendict, ret))
 
+  def inputs_as_set(self):
+    for inn in set(self.inputs):
+      yield inn

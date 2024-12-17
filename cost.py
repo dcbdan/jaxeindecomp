@@ -1,5 +1,6 @@
 from utils import *
 from graph import *
+from trees import partition_into_trees
 
 # 1. start with a node
 # 2. recurse down
@@ -9,14 +10,18 @@ def solve_partitions(output_node: Node, target_n):
   log2_n = get_power_of_2(target_n)
   if log2_n is None:
     raise ValueError("invalid target_n; must be a power of 2")
-  ret = None
-  best = None
-  for p in output_node.op.out_partitions(log2_n):
-    all_ps, cost = solve_partitions_(output_node, log2_n, p)
-    if best is None or cost < best:
-      best = cost
-      ret = all_ps
-  return all_ps
+
+  total_ret = {}
+  for tree_root, _ in partition_into_trees(output_node):
+    ret = None
+    best = None
+    for p in tree_root.op.out_partitions(log2_n):
+      all_ps, cost = solve_partitions_(total_ret)(tree_root, log2_n, p)
+      if best is None or cost < best:
+        best = cost
+        ret = all_ps
+    total_ret = unions([total_ret, ret])
+  return total_ret
 
 def cost_join(es_shape, es_parts, join_part):
   ret = 0
@@ -33,10 +38,6 @@ def cost_join(es_shape, es_parts, join_part):
 
 # Note: this incorporates aggregtations
 def cost_repart(es_shape, inn_part, out_part):
-  print(es_shape)
-  print(inn_part)
-  print(out_part)
-
   if inn_part == out_part:
     return 0
   if len(inn_part) > len(out_part):
@@ -84,79 +85,105 @@ def cost_repart(es_shape, inn_part, out_part):
   for mode in inn_part.keys():
     a = inn_part[mode]
     b = out_part[mode]
-    print(f"{mode}: {a}, {b}")
     to_out += max(a,b) - a
     to_inn += max(a,b) - b
 
-  print(f"to_out: {2**to_out}")
-  print(f"to_inn: {2**to_inn}")
-  print(f"inn blksize {inn_blocksize}")
-  print(f"out blksize {out_blocksize}")
-
   cost_to_out   = (2**to_out)       * inn_blocksize * n_inn_blocks
   cost_move_out = ((2**to_inn) - 1) * out_blocksize * n_out_blocks
-  print(f"cost to out   {cost_to_out}")
-  print(f"cost move out {cost_move_out}")
 
   return cost_to_out + cost_move_out
 
-def all_input_partitions(node, log2_n):
-  options = [inn_node.op.out_partitions(log2_n) for inn_node in node.inputs]
+def all_input_partitions(node, log2_n, node_to_set_part = {}):
+  def get(inn_node):
+    # make sure to do the agg first here
+    if (inn_node, "Agg") in node_to_set_part:
+      p = node_to_set_part[(inn_node, "Agg")]
+      return [ p ]
+    elif (inn_node, "Join") in node_to_set_part:
+      p = node_to_set_part[(inn_node, "Join")]
+      if set(p.keys()) != set(inn_node.op.out_modes()):
+        raise ValueError("this join part isn't an out part")
+      return [ p ]
+    else:
+      return inn_node.op.out_partitions(log2_n)
+
+  options = [get(inn_node) for inn_node in node.inputs]
   return itertools_product(*options)
 
-def union_parts(ps):
+def unions(ps):
   if len(ps) == 0:
     return {}
 
   ret = {k:v for k,v in ps[0].items()}
   for d in ps[1:]:
     for k, v in d.items():
-      if k in ret:
-        raise ValueError("expect keys to be disjoint!")
       ret[k] = v
   return ret
 
-@cache
-def solve_partitions_(node, log2_n, p):
-  es_shape = node.op.es_shape()
-  if len(p) == node.op.es_rank():
-    # this is the join portion
-    best = None
-    ret = None
-    join_cost = cost_join(es_shape, node.op.es_parts(), p)
-    fini_parts = node.get_expected_input_parts(p)
-    inn_shapes = node.get_inn_shapes()
-    for input_parts in all_input_partitions(node, log2_n):
-      all_ps = []
-      cost = 0
-      for init_part, inn_shape, fini_part, inn_node in zip(input_parts, inn_shapes, fini_parts, node.inputs):
-        print("A", inn_shape, init_part, fini_part)
-        all_ps_, cost_init = solve_partitions_(inn_node, log2_n, init_part)
-        all_ps.append(all_ps_)
-        cost += cost_init
-        cost += cost_repart(inn_shape, init_part, fini_part)
-      cost += join_cost
+def disjoint_unions(ps):
+  if len(ps) == 0:
+    return {}
+  for x in ps:
+    keys = []
+    for k, _ in x.keys():
+      keys.append(k.name)
 
-      if best is None or cost < best:
-        best = cost
-        ret = union_parts(all_ps)
+  ret = {k:v for k,v in ps[0].items()}
+  for d in ps[1:]:
+    for k, v in d.items():
+      if k in ret:
+        raise ValueError("expect keys to be disjoint! (maybe this was never a tree...)")
+      ret[k] = v
+  return ret
 
-    ret[(node, "Join")] = p
-    return ret, best
-  else:
-    # this is the agg portion
-    best = None
-    ret = None
-    for join_p in node.op.join_partitions(log2_n):
-      all_ps, cost = solve_partitions_(node, log2_n, join_p)
-      print("B", es_shape, join_p, p)
-      cost += cost_repart(es_shape, join_p, p)
+class solve_partitions_:
+  def __init__(self, prev_ps = {}):
+    self.prev_ps = prev_ps
 
-      if best is None or cost < best:
-        ret = all_ps
-        best = cost
+  def _in_prev(self, node):
+    # (all nodes have an associated join)
+    return (node, "Join") in self.prev_ps
 
-    ret[(node, "Agg")] = p
-    return ret, best
+  @cache
+  def __call__(self, node, log2_n, p):
+    es_shape = node.op.es_shape()
+    if len(p) == node.op.es_rank():
+      # this is the join portion
+      best = None
+      ret = None
+      join_cost = cost_join(es_shape, node.op.es_parts(), p)
+      fini_parts = node.get_expected_input_parts(p)
+      inn_shapes = node.get_inn_shapes()
+      for input_parts in all_input_partitions(node, log2_n, self.prev_ps):
+        all_ps = []
+        cost = 0
+        for init_part, inn_shape, fini_part, inn_node in zip(input_parts, inn_shapes, fini_parts, node.inputs):
+          if not self._in_prev(inn_node):
+            all_ps_, cost_init = self(inn_node, log2_n, init_part)
+            all_ps.append(all_ps_)
+            cost += cost_init
+          cost += cost_repart(inn_shape, init_part, fini_part)
+        cost += join_cost
+
+        if best is None or cost < best:
+          best = cost
+          ret = disjoint_unions(all_ps)
+
+      ret[(node, "Join")] = p
+      return ret, best
+    else:
+      # this is the agg portion
+      best = None
+      ret = None
+      for join_p in node.op.join_partitions(log2_n):
+        all_ps, cost = self(node, log2_n, join_p)
+        cost += cost_repart(es_shape, join_p, p)
+
+        if best is None or cost < best:
+          ret = all_ps
+          best = cost
+
+      ret[(node, "Agg")] = p
+      return ret, best
 
 
