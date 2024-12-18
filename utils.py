@@ -63,3 +63,12 @@ class catchtime:
     self.time = perf_counter() - self.start
     self.readout = f'Time: {self.time:.3f} seconds'
     print(self.readout)
+
+#################################
+def print_sharded_tensor_info(x):
+  """
+  print sharding of jax sharded tensor
+  """
+  for i, shard in enumerate(x.global_shards):
+    print(f"shard {i} @ {str(shard.device)} with shape {shard.data.shape} and index {str(shard.index)}")
+

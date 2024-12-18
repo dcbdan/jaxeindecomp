@@ -6,7 +6,7 @@ from trees import partition_into_trees
 # 2. recurse down
 # 3. cache (node, partition) pairs
 
-def solve_partitions(output_node: Node, target_n):
+def solve_partitions(output_node: Node, target_n, return_tuple = False):
   log2_n = get_power_of_2(target_n)
   if log2_n is None:
     raise ValueError("invalid target_n; must be a power of 2")
@@ -21,7 +21,17 @@ def solve_partitions(output_node: Node, target_n):
         best = cost
         ret = all_ps
     total_ret = unions([total_ret, ret])
-  return total_ret
+  if return_tuple:
+    join_parts = {}
+    agg_parts  = {}
+    for (node, s), part in total_ret.items():
+      if s == "Join":
+        join_parts[node.name] = part
+      else:
+        agg_parts[node.name] = part
+    return join_parts, agg_parts
+  else:
+    return total_ret
 
 def cost_join(es_shape, es_parts, join_part):
   ret = 0

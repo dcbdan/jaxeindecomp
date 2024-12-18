@@ -6,6 +6,12 @@ import jax.numpy as jnp
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
+from jax.experimental.shard_map import shard_map
+
+from jax.lax import with_sharding_constraint
+
+from functools import partial
+
 class BaseOp:
   def es_str(self):
     raise NotImplementedError("BaseOp: es str")
@@ -74,7 +80,7 @@ class BaseOp:
         inn_modes.add(mode)
 
     out_modes = set()
-    for mode in out_modes:
+    for mode in out:
       out_modes.add(mode)
 
     ret = set()
@@ -120,7 +126,7 @@ class MatmulOp(BaseOp):
     return lhs @ rhs
   def exec_decomp(self, x, y, join_part=None, agg_part=None):
     if join_part is None or agg_part is None:
-      raise ValueError("join and agg parts must be set for matmul")
+      raise ValueError("join and agg parts must be set")
 
     join_mesh = jax.make_mesh([join_part[m] for m in "ijk"], ("i", "j", "k"))
     agg_mesh  = jax.make_mesh([agg_part[m] for m in "ik"], ("i", "k"))
@@ -129,7 +135,7 @@ class MatmulOp(BaseOp):
       in_specs =(P('i', 'j'), P('j', 'k')),
       out_specs=P('i', 'j', 'k'))
     def matmul_join(x_block, y_block):
-      z_block = x_block * y_block
+      z_block = x_block @ y_block
       m, n = z_block.shape
       return z_block.reshape(m, 1, n)
 
@@ -162,16 +168,113 @@ class Contraction(BaseOp):
     return self._es_shape
   def exec(self, lhs, rhs):
     return jnp.einsum(self._es_str, lhs, rhs)
-  #def exec_decomp(self, x, y, join_part=None, agg_part=None):
-  #  if join_part is None or agg_part is None:
-  #    raise ValueError("join and agg parts must be set for matmul")
-  #  # TODO
-  #  join_mesh = jax.make_mesh([join_part[m] for m in "ijk"], ("i", "j", "k"))
-  #  agg_mesh  = jax.make_mesh([agg_part[m] for m in "ik"], ("i", "k"))
+  def exec_decomp(self, x, y, join_part=None, agg_part=None):
+    if join_part is None or agg_part is None:
+      raise ValueError("join and agg parts must be set")
+    join_modes = abc_to(self.es_rank())
+    out_modes  = abc_to(self.out_rank())
+
+    join_mesh = jax.make_mesh([join_part[m] for m in join_modes], tuple(join_modes))
+    agg_mesh  = jax.make_mesh([agg_part[m]  for m in out_modes],  tuple(out_modes))
+
+    nagg_modes = len(join_modes) - len(out_modes)
+
+    lhs_modes, rhs_modes = self.es_parts()[:-1]
+
+    @partial(shard_map, mesh=join_mesh,
+      in_specs =(P(*lhs_modes), P(*rhs_modes)),
+      out_specs=P(*join_modes))
+    def matmul_join(x_block, y_block):
+      z_block = jnp.einsum(self._es_str, x_block, y_block)
+      shape = z_block.shape + tuple(1 for _ in range(nagg_modes))
+      return z_block.reshape(*shape)
+
+    z = with_sharding_constraint(
+      matmul_join(x, y),
+      NamedSharding(join_mesh, P(*tuple(join_modes))))
+
+    p_spec_replicate = P(*( tuple(out_modes) + tuple(None for _ in range(nagg_modes))))
+    z = with_sharding_constraint(z,
+      NamedSharding(agg_mesh, p_spec_replicate))
+
+    z = with_sharding_constraint(
+      jnp.einsum(join_modes + "->" + out_modes, z),
+      NamedSharding(agg_mesh, P(*tuple(out_modes))))
+
+    return z
 
 def _unary_ew_str_shape(shape):
   m = abc_to(len(shape))
   return m + "->" + m, {k: v for k, v in zip(m, shape)}
+
+def _abc_unary_ew_exec_decomp(f, inn, rank, join_part):
+  if join_part is None:
+    raise ValueError("join part must be set")
+
+  modes = abc_to(rank)
+  join_mesh = jax.make_mesh([join_part[m] for m in modes], tuple(modes))
+
+  @partial(shard_map, mesh=join_mesh,
+    in_specs =P(*modes),
+    out_specs=P(*modes))
+  def ew(inn_block):
+    return f(inn_block)
+
+  return with_sharding_constraint(
+    ew(inn),
+    NamedSharding(join_mesh, P(*tuple(modes))))
+
+def _abc_reduction_exec_decomp(f, inn, out_rank, join_part, agg_part):
+  """
+  reduce "abc->ab" and "abcd->abc" and so on
+  """
+  if join_part is None or agg_part is None:
+    raise ValueError("join and agg parts must be set")
+
+  join_modes = abc_to(out_rank + 1)
+  out_modes = abc_to(out_rank)
+
+  join_mesh = jax.make_mesh([join_part[m] for m in join_modes], tuple(join_modes))
+  agg_mesh  = jax.make_mesh([agg_part[m]  for m in out_modes],  tuple(out_modes))
+
+  @partial(shard_map, mesh=join_mesh,
+    in_specs =P(*join_modes),
+    out_specs=P(*join_modes))
+  def reduce_join(inn_block):
+    ret = f(inn_block)
+    shape = ret.shape + (1,)
+    return ret.reshape(*shape)
+
+  out = with_sharding_constraint(
+    reduce_join(inn),
+    NamedSharding(join_mesh, P(*tuple(join_modes))))
+
+  p_spec_replicate = P(*( tuple(out_modes) + (None,)))
+  out = with_sharding_constraint(out,
+    NamedSharding(agg_mesh, p_spec_replicate))
+
+  out = with_sharding_constraint(
+    f(out),
+    NamedSharding(agg_mesh, P(*tuple(out_modes))))
+
+  return out
+
+def _abcd_abc_abcd_ew_exec_decomp(f, lhs, rhs, join_part):
+  if join_part is None:
+    raise ValueError("join part must be set")
+
+  modes = "abcd"
+  join_mesh = jax.make_mesh([join_part[m] for m in modes], tuple(modes))
+
+  @partial(shard_map, mesh=join_mesh,
+    in_specs =(P('a','b','c','d'), P('a','b','c')),
+    out_specs=P('a','b','c','d'))
+  def ew(lhs_block, rhs_block):
+    return f(lhs_block, rhs_block)
+
+  return with_sharding_constraint(
+    ew(lhs, rhs),
+    NamedSharding(join_mesh, P('a','b','c','d')))
 
 class Scale(BaseOp):
   def __init__(self, shape):
@@ -182,6 +285,12 @@ class Scale(BaseOp):
     return self._es_shape
   def exec(self, inn):
     return inn*0.012345
+  def exec_decomp(self, inn, join_part=None, agg_part=None):
+    return _abc_unary_ew_exec_decomp(
+      lambda x: x*0.012345,
+      inn,
+      self.out_rank(),
+      join_part)
 
 class Exp(BaseOp):
   def __init__(self, shape):
@@ -192,6 +301,12 @@ class Exp(BaseOp):
     return self._es_shape
   def exec(self, inn):
     return jnp.exp(inn)
+  def exec_decomp(self, inn, join_part=None, agg_part=None):
+    return _abc_unary_ew_exec_decomp(
+      lambda x: jnp.exp(x),
+      inn,
+      self.out_rank(),
+      join_part)
 
 class Relu(BaseOp):
   def __init__(self, shape):
@@ -202,6 +317,12 @@ class Relu(BaseOp):
     return self._es_shape
   def exec(self, inn):
     return jax.nn.relu(inn)
+  def exec_decomp(self, inn, join_part=None, agg_part=None):
+    return _abc_unary_ew_exec_decomp(
+      lambda x: jnp.exp(x),
+      inn,
+      self.out_rank(),
+      join_part)
 
 class Maximum(BaseOp):
   def __init__(self, abc_str, abc_shape):
@@ -215,6 +336,15 @@ class Maximum(BaseOp):
     if self._es_str in ["ab->a", "abc->ab", "abcd->abc", "abcde->abcd"]:
       return jnp.max(inn, axis=-1)
     raise NotImplementedError("Maximum exec op")
+  def exec_decomp(self, inn, join_part=None, agg_part=None):
+    if self._es_str not in ["ab->a", "abc->ab", "abcd->abc", "abcde->abcd"]:
+      raise NotImplementedError("Maximum exec op")
+    return _abc_reduction_exec_decomp(
+      lambda x: jnp.max(x, axis=-1),
+      inn,
+      self.out_rank(),
+      join_part,
+      agg_part)
 
 class Subtract(BaseOp):
   def __init__(self, abc_str, abc_shape):
@@ -229,6 +359,13 @@ class Subtract(BaseOp):
       new_rhs_shape = rhs.shape + (1,)
       return lhs - rhs.reshape(new_rhs_shape)
     raise NotImplementedError("Subtract exec op: " + self._es_str)
+  def exec_decomp(self, lhs, rhs, join_part=None, agg_part=None):
+    if self._es_str != "abcd,abc->abcd":
+      raise NotImplementedError("abcd,abc->abcd only for Subtract")
+    return _abcd_abc_abcd_ew_exec_decomp(
+      lambda x, y: self.exec(x, y),
+      lhs, rhs,
+      join_part)
 
 class Reduction(BaseOp):
   def __init__(self, abc_str, abc_shape):
@@ -242,6 +379,15 @@ class Reduction(BaseOp):
     if self._es_str in ["ab->a", "abc->ab", "abcd->abc", "abcde->abcd"]:
       return jnp.sum(inn, axis=-1)
     raise NotImplementedError("Reduction exec op")
+  def exec_decomp(self, inn, join_part=None, agg_part=None):
+    if self._es_str not in ["ab->a", "abc->ab", "abcd->abc", "abcde->abcd"]:
+      raise NotImplementedError("Reduction exec op")
+    return _abc_reduction_exec_decomp(
+      lambda x: jnp.sum(x, axis=-1),
+      inn,
+      self.out_rank(),
+      join_part,
+      agg_part)
 
 class Division(BaseOp):
   def __init__(self, abc_str, abc_shape):
@@ -256,6 +402,13 @@ class Division(BaseOp):
       new_rhs_shape = rhs.shape + (1,)
       return lhs / rhs.reshape(new_rhs_shape)
     raise NotImplementedError("Division exec op")
+  def exec_decomp(self, lhs, rhs, join_part=None, agg_part=None):
+    if self._es_str != "abcd,abc->abcd":
+      raise NotImplementedError("abcd,abc->abcd only for Division")
+    return _abcd_abc_abcd_ew_exec_decomp(
+      lambda x, y: self.exec(x, y),
+      lhs, rhs,
+      join_part)
 
 class Add(BaseOp):
   def __init__(self, abc_str, abc_shape):
@@ -270,6 +423,28 @@ class Add(BaseOp):
     if all(p == parts[0] for p in parts[1:]):
       return lhs + rhs
     raise NotImplementedError("Add exec op")
+  def exec_decomp(self, lhs, rhs, join_part=None, agg_part=None):
+    if join_part is None:
+      raise ValueError("join part must be set")
+
+    parts = self.es_parts()
+    if not all(p == parts[0] for p in parts[1:]):
+      return NotImplementedError("Add exec decomp op")
+
+    modes = parts[0]
+    join_mesh = jax.make_mesh([join_part[m] for m in modes], tuple(modes))
+
+    pp = P(*modes)
+
+    @partial(shard_map, mesh=join_mesh,
+      in_specs =(pp, pp),
+      out_specs=pp)
+    def f(lhs_block, rhs_block):
+      return lhs_block + rhs_block
+
+    return with_sharding_constraint(
+      f(lhs, rhs),
+      NamedSharding(join_mesh, pp))
 
 class InputOp(BaseOp):
   def __init__(self, shape):
@@ -280,6 +455,8 @@ class InputOp(BaseOp):
     return {mode: sz for mode, sz in zip(self.es_str(), self.shape)}
   def exec(self):
     raise RuntimeError("can't execute input base op...")
+  def exec_decomp(*args, **kwargs):
+    raise RuntimeError("can't execute decomp input base op...")
 
 class Node:
   def __init__(self, name, op, inputs):
@@ -373,11 +550,15 @@ def graph_exec_decomp(root, data, join_parts, agg_parts):
     for inn in node.inputs:
       recurse(inn)
 
-    args   = [data[inn.name] for inn in node.inputs]
+    args = [data[inn.name] for inn in node.inputs]
 
     kwargs = {}
+    if node.name not in join_parts:
+      raise ValueError(f"join parts does not contain key={node.name}")
     kwargs["join_part"] = join_parts[node.name]
     if node.op.has_aggregation():
+      if node.name not in agg_parts:
+        raise ValueError(f"agg parts does not contain key={node.name}")
       kwargs["agg_part"] = agg_parts[node.name]
 
     data[node.name] = node.op.exec_decomp(*args, **kwargs)
