@@ -3,6 +3,11 @@ from itertools import product as itertools_product
 
 from frozendict import frozendict
 
+def abc_to(n):
+  if n > 26:
+    raise ValueError("abc_to: n > 26")
+  return "abcdefghijklmnopqrstuvwxyz"[:n]
+
 def all_sum_tos(n, v):
   if n == 0:
     return [ [0]*v ]
@@ -44,3 +49,17 @@ def product(xs):
   for x in xs:
     ret *= x
   return ret
+
+#################################
+# https://stackoverflow.com/questions/33987060/python-context-manager-that-measures-time
+from time import perf_counter
+
+class catchtime:
+  def __enter__(self):
+    self.start = perf_counter()
+    return self
+
+  def __exit__(self, type, value, traceback):
+    self.time = perf_counter() - self.start
+    self.readout = f'Time: {self.time:.3f} seconds'
+    print(self.readout)

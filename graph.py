@@ -1,11 +1,28 @@
 from utils import *
 
+import jax
+import jax.numpy as jnp
+
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
+
 class BaseOp:
   def es_str(self):
     raise NotImplementedError("BaseOp: es str")
 
   def es_shape(self):
     raise NotImplementedError("BaseOp: einsum shape")
+
+  def exec(self, *args):
+    raise NotImplementedError("BaseOp: exec")
+
+  def exec_decomp(self, *args, **kwargs):
+    """
+    args must provide the input tensors
+    kwargs must provide the join and agg partitions
+    """
+    raise NotImplementedError("BaseOp: exec decomp")
+
 
   def es_modes(self):
     ret = []
@@ -99,6 +116,35 @@ class MatmulOp(BaseOp):
     return "ij,jk->ik"
   def es_shape(self):
     return {"i": self.ni, "j": self.nj, "k": self.nk}
+  def exec(self, lhs, rhs):
+    return lhs @ rhs
+  def exec_decomp(self, x, y, join_part=None, agg_part=None):
+    if join_part is None or agg_part is None:
+      raise ValueError("join and agg parts must be set for matmul")
+
+    join_mesh = jax.make_mesh([join_part[m] for m in "ijk"], ("i", "j", "k"))
+    agg_mesh  = jax.make_mesh([agg_part[m] for m in "ik"], ("i", "k"))
+
+    @partial(shard_map, mesh=join_mesh,
+      in_specs =(P('i', 'j'), P('j', 'k')),
+      out_specs=P('i', 'j', 'k'))
+    def matmul_join(x_block, y_block):
+      z_block = x_block * y_block
+      m, n = z_block.shape
+      return z_block.reshape(m, 1, n)
+
+    z = with_sharding_constraint(
+      matmul_join(x, y),
+      NamedSharding(join_mesh, P('i', 'j', 'k')))
+
+    z = with_sharding_constraint(z,
+      NamedSharding(agg_mesh, P('i', None, 'k')))
+
+    z = with_sharding_constraint(
+      jnp.einsum("ijk->ik", z),
+      NamedSharding(agg_mesh, P('i', 'k')))
+
+    return z
 
 def _abc_shape(es_str, es_shape):
   modes = sorted(set(c for c in es_str if c.isalpha()))
@@ -114,9 +160,17 @@ class Contraction(BaseOp):
     return self._es_str
   def es_shape(self):
     return self._es_shape
+  def exec(self, lhs, rhs):
+    return jnp.einsum(self._es_str, lhs, rhs)
+  #def exec_decomp(self, x, y, join_part=None, agg_part=None):
+  #  if join_part is None or agg_part is None:
+  #    raise ValueError("join and agg parts must be set for matmul")
+  #  # TODO
+  #  join_mesh = jax.make_mesh([join_part[m] for m in "ijk"], ("i", "j", "k"))
+  #  agg_mesh  = jax.make_mesh([agg_part[m] for m in "ik"], ("i", "k"))
 
 def _unary_ew_str_shape(shape):
-  m = "abcdefghijklmnopqrstuvwxyz"[:len(shape)]
+  m = abc_to(len(shape))
   return m + "->" + m, {k: v for k, v in zip(m, shape)}
 
 class Scale(BaseOp):
@@ -126,6 +180,8 @@ class Scale(BaseOp):
     return self._es_str
   def es_shape(self):
     return self._es_shape
+  def exec(self, inn):
+    return inn*0.012345
 
 class Exp(BaseOp):
   def __init__(self, shape):
@@ -134,6 +190,8 @@ class Exp(BaseOp):
     return self._es_str
   def es_shape(self):
     return self._es_shape
+  def exec(self, inn):
+    return jnp.exp(inn)
 
 class Relu(BaseOp):
   def __init__(self, shape):
@@ -142,6 +200,8 @@ class Relu(BaseOp):
     return self._es_str
   def es_shape(self):
     return self._es_shape
+  def exec(self, inn):
+    return jax.nn.relu(inn)
 
 class Maximum(BaseOp):
   def __init__(self, abc_str, abc_shape):
@@ -151,6 +211,10 @@ class Maximum(BaseOp):
     return self._es_str
   def es_shape(self):
     return self._es_shape
+  def exec(self, inn):
+    if self._es_str in ["ab->a", "abc->ab", "abcd->abc", "abcde->abcd"]:
+      return jnp.max(inn, axis=-1)
+    raise NotImplementedError("Maximum exec op")
 
 class Subtract(BaseOp):
   def __init__(self, abc_str, abc_shape):
@@ -160,6 +224,11 @@ class Subtract(BaseOp):
     return self._es_str
   def es_shape(self):
     return self._es_shape
+  def exec(self, lhs, rhs):
+    if self._es_str == "abcd,abc->abcd":
+      new_rhs_shape = rhs.shape + (1,)
+      return lhs - rhs.reshape(new_rhs_shape)
+    raise NotImplementedError("Subtract exec op: " + self._es_str)
 
 class Reduction(BaseOp):
   def __init__(self, abc_str, abc_shape):
@@ -169,6 +238,10 @@ class Reduction(BaseOp):
     return self._es_str
   def es_shape(self):
     return self._es_shape
+  def exec(self, inn):
+    if self._es_str in ["ab->a", "abc->ab", "abcd->abc", "abcde->abcd"]:
+      return jnp.sum(inn, axis=-1)
+    raise NotImplementedError("Reduction exec op")
 
 class Division(BaseOp):
   def __init__(self, abc_str, abc_shape):
@@ -178,6 +251,11 @@ class Division(BaseOp):
     return self._es_str
   def es_shape(self):
     return self._es_shape
+  def exec(self, lhs, rhs):
+    if self._es_str == "abcd,abc->abcd":
+      new_rhs_shape = rhs.shape + (1,)
+      return lhs / rhs.reshape(new_rhs_shape)
+    raise NotImplementedError("Division exec op")
 
 class Add(BaseOp):
   def __init__(self, abc_str, abc_shape):
@@ -187,14 +265,21 @@ class Add(BaseOp):
     return self._es_str
   def es_shape(self):
     return self._es_shape
+  def exec(self, lhs, rhs):
+    parts = self.es_parts()
+    if all(p == parts[0] for p in parts[1:]):
+      return lhs + rhs
+    raise NotImplementedError("Add exec op")
 
 class InputOp(BaseOp):
   def __init__(self, shape):
     self.shape = shape
   def es_str(self):
-    return "abcdefghijklmnopqrstuvwxyz"[:len(self.shape)]
+    return abc_to(len(self.shape))
   def es_shape(self):
     return {mode: sz for mode, sz in zip(self.es_str(), self.shape)}
+  def exec(self):
+    raise RuntimeError("can't execute input base op...")
 
 class Node:
   def __init__(self, name, op, inputs):
@@ -206,7 +291,7 @@ class Node:
     self.outputs = set()
 
   def __repr__(self):
-    return self.name
+    return "N." + self.name
 
   def is_input(self):
     return False
@@ -241,3 +326,98 @@ class Node:
   def inputs_as_set(self):
     for inn in set(self.inputs):
       yield inn
+
+def graph_init_zeros(root):
+  return {
+    inn.name: jnp.zeros(inn.op.out_shape())
+    for inn in graph_all_inputs(root)
+  }
+
+def graph_init_zeros_replicated(root, nlocs):
+  mesh = jax.make_mesh((nlocs,), ('a',))
+  def init(shape):
+    return jax.device_put(
+      jnp.zeros(shape),
+      NamedSharding(mesh, P(*[None for _ in range(len(shape))])))
+  return {
+    inn.name: init(inn.op.out_shape())
+    for inn in graph_all_inputs(root)
+  }
+
+def graph_exec(root, data):
+  """
+  root: the graph node whose tensor is to be computed
+  data: mapping from node name to input tensors
+
+  On completion, data contains all intermediate tensors
+  """
+  def recurse(node):
+    if node.name in data:
+      return
+    for inn in node.inputs:
+      recurse(inn)
+    data[node.name] = node.op.exec(*[data[inn.name] for inn in node.inputs])
+
+  recurse(root)
+
+def graph_exec_decomp(root, data, join_parts, agg_parts):
+  """
+  root:  the graph node whose tensor is to be computed
+  data:  mapping from node name to input tensors
+  join_parts: mapping from node name to join partition
+  agg_parts: mapping from node name to agg partition
+  """
+  def recurse(node):
+    if node.name in data:
+      return
+    for inn in node.inputs:
+      recurse(inn)
+
+    args   = [data[inn.name] for inn in node.inputs]
+
+    kwargs = {}
+    kwargs["join_part"] = join_parts[node.name]
+    if node.op.has_aggregation():
+      kwargs["agg_part"] = agg_parts[node.name]
+
+    data[node.name] = node.op.exec_decomp(*args, **kwargs)
+
+  recurse(root)
+
+def graph_all_inputs(root):
+  def is_input(node):
+    return len(node.inputs) == 0
+  return [node for node in graph_all_nodes(root).values() if is_input(node)]
+
+def graph_all_nodes(node):
+  """
+  return mapping from node.name to the node
+  """
+  ret = {}
+  pending = [node]
+  while len(pending) > 0:
+    node = pending.pop()
+    if node.name in ret:
+      continue
+
+    ret[node.name] = node
+
+    pending += list(node.outputs)
+    pending += list(node.inputs)
+
+  return ret
+
+def graph_has_path(inn, out):
+  seen = set()
+  pending = [inn]
+  while len(pending) > 0:
+    node = pending.pop()
+    for mid in node.outputs:
+      if mid == out:
+        return True
+      elif mid not in seen:
+        seen.add(mid)
+        pending.append(mid)
+  return False
+
+

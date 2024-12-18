@@ -1,3 +1,5 @@
+from graph import graph_has_path
+
 #     X
 #    A B M
 #      C N
@@ -8,35 +10,6 @@
 # As an invariant, force that all nodes
 # in a tree must have exactly one path to the root,
 # otherwise the node itself becomes another root
-
-def graph_all_nodes(node):
-  ret = {}
-  pending = [node]
-  while len(pending) > 0:
-    node = pending.pop()
-    if node.name in ret:
-      continue
-
-    ret[node.name] = node
-
-    pending += list(node.outputs)
-    pending += list(node.inputs)
-
-  return ret
-
-def graph_has_path(inn, out):
-  seen = set()
-  pending = [inn]
-  while len(pending) > 0:
-    node = pending.pop()
-    for mid in node.outputs:
-      if mid == out:
-        return True
-      elif mid not in seen:
-        seen.add(mid)
-        pending.append(mid)
-  return False
-
 
 def partition_into_trees(root):
   def _has_path_not_through(inn, out, not_here):
