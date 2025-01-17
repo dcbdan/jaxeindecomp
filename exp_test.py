@@ -85,10 +85,10 @@ def test(model, bsz, slen, nlocs):
   t_batch  = exec_split_batch()
   t_heads  = exec_split_heads()
   if t_batch == "NA":
-    timestr = f"decomp={t_decomp:.3f}, batch={t_batch}, heads={t_heads:.3f}"
+    timestr = f"decomp={t_decomp:.5f}, batch={t_batch}, heads={t_heads:.5f}"
   else:
-    timestr = f"decomp={t_decomp:.3f}, batch={t_batch:.3f}, heads={t_heads:.3f}"
-  print(f"RESULT: {model}, bsz={bsz}, slen={slen}, nlocs={nlocs}: " + timestr)
+    timestr = f"decomp={t_decomp:.5f}, batch={t_batch:.5f}, heads={t_heads:.5f}"
+  print(f"RESULT: {model}, bsz={bsz}, slen={slen}, nlocs={nlocs}: " + timestr, flush=True)
 
 test("7B", 1, 1000, 8)
 test("7B", 2, 1000, 8)
