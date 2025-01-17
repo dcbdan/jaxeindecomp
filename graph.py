@@ -520,6 +520,15 @@ def graph_init_zeros_replicated(root, nlocs):
     inn.name: init(inn.op.out_shape())
     for inn in graph_all_inputs(root)
   }
+def graph_init_zeros_sharded(root, shards):
+  def init(inn):
+    shard = shards[inn.name]
+    shape = inn.op.out_shape()
+    return jax.device_put(jnp.zeros(shape), shard)
+  return {
+    inn.name: init(inn)
+    for inn in graph_all_inputs(root)
+  }
 
 def graph_exec(root, data):
   """

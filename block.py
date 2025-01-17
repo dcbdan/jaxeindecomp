@@ -84,6 +84,7 @@ def block(headdim = 128, nheads = 32, bsz = 1, seqlen = 1234, hidden = 11008):
     [bsz, seqlen, hidden, nheads, headdim]),
     [e28, i0])
 
+
   e32 = Node("e32", Contraction(
     "abde,cde->abc",
     [bsz, seqlen, hidden, nheads, headdim]),
@@ -106,4 +107,84 @@ def block(headdim = 128, nheads = 32, bsz = 1, seqlen = 1234, hidden = 11008):
     [e28, e35])
 
   return e37
+
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
+
+def block_input_sharding_split_batch(nlocs):
+  # Just data parallel...
+  mesh = jax.make_mesh([nlocs], ["i"])
+  def make_split(idx, n):
+    ret = [None]*n
+    ret[idx] = "i"
+    return NamedSharding(mesh, P(*ret))
+  def make_replicate(n):
+    ret = [None]*n
+    return NamedSharding(mesh, P(*ret))
+  return {
+    "i3": make_replicate(4),
+    "i4": make_replicate(4),
+    "i5": make_replicate(4),
+    "i7": make_split(0, 4),
+    "i6": make_replicate(4),
+    "i0": make_replicate(3),
+    "i2": make_replicate(3),
+    "i1": make_replicate(3) }
+
+from itertools import product
+def block_input_sharding_split_heads(nlocs, allofem = False):
+  if nlocs == 1:
+    nA, nB = 1, 1
+  elif nlocs == 2:
+    nA, nB = 2, 1
+  elif nlocs == 4:
+    nA, nB = 2, 2
+  elif nlocs == 8:
+    nA, nB = 4, 2
+  elif nlocs == 16:
+    nA, nB = 4, 4
+  elif nlocs == 32:
+    nA, nB = 8, 4
+  else:
+    raise ValueError("invalid sizing")
+  mesh = jax.make_mesh([nA, nB], ["i", "j"])
+  def make_both(i, j, n):
+    ret = [None]*n
+    ret[i] = "i"
+    ret[j] = "j"
+    return NamedSharding(mesh, P(*ret))
+  def make_lhs(i, n):
+    ret = [None]*n
+    ret[i] = "i"
+    return NamedSharding(mesh, P(*ret))
+  def make_rhs(j, n):
+    ret = [None]*n
+    ret[j] = "j"
+    return NamedSharding(mesh, P(*ret))
+  if allofem:
+    pass
+    #keys = ["i3", "i4", "i5", "i7", "i6", "i0", "i2", "i1"]
+    #opts = [
+    #          [make_both(0, 2, 4), make_both(2, 0, 4)],
+    #          [make_both(0, 2, 4), make_both(2, 0, 4)],
+    #          [make_both(0, 2, 4), make_both(2, 0, 4)],
+    #          [make_rhs(2, 4), make_lhs(2, 4)],
+    #          [make_both(0, 2, 4), make_both(2, 0, 4)],
+    #          [make_lhs(1, 3), make_rhs(1, 3)],
+    #          [make_lhs(1, 3), make_rhs(1, 3)],
+    #          [make_rhs(1, 3), make_lhs(1, 3)]]
+    #for opt in product(*opts):
+    #  yield {k: v for k, v in zip(keys, opt)}
+  else:
+    return {
+        "i3": make_both(0, 2, 4),
+        "i4": make_both(0, 2, 4),
+        "i5": make_both(0, 2, 4),
+        "i7": make_lhs(2, 4),
+        "i6": make_both(2, 0, 4),
+        "i0": make_lhs(1, 3),
+        "i2": make_lhs(1, 3),
+        "i1": make_rhs(1, 3)
+    }
+
 

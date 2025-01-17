@@ -2,10 +2,13 @@ import os
 os.environ["XLA_FLAGS"] = '--xla_force_host_platform_device_count=8' # Use 8 CPU devices
 
 import graph as g
-from graph import graph_init_zeros, graph_init_zeros_replicated, graph_all_nodes
+from graph import graph_all_nodes
+from graph import graph_init_zeros, graph_init_zeros_replicated, graph_init_zeros_sharded
 from graph import graph_exec, graph_exec_decomp
 
 from block import block
+from block import block_input_sharding_split_batch
+from block import block_input_sharding_split_heads
 from utils import catchtime
 from utils import print_sharded_tensor_info as print_info
 from cost import solve_partitions
@@ -110,4 +113,81 @@ def exp03():
   if out.op.has_aggregation():
     print(agg_parts[out.name])
 
-exp03()
+def exp04_split_batch(bsz, nlocs):
+  out = block(bsz=bsz)
+
+  @jax.jit
+  def exec(tensors):
+    graph_exec(out, tensors)
+    return tensors[out.name]
+
+  shards = block_input_sharding_split_batch(nlocs)
+  init_data = graph_init_zeros_sharded(out, shards)
+
+  for tensor in init_data.values():
+    tensor.block_until_ready()
+
+  with catchtime():
+    t = exec({k: v for k, v in init_data.items()})
+    t.block_until_ready()
+  with catchtime():
+    t = exec(init_data)
+    t.block_until_ready()
+
+def exp05_split_heads():
+  nlocs = 4
+  out = block()
+
+  @jax.jit
+  def exec(tensors):
+    graph_exec(out, tensors)
+    return tensors[out.name]
+
+  shards = block_input_sharding_split_heads(nlocs)
+  init_data = graph_init_zeros_sharded(out, shards)
+
+  for tensor in init_data.values():
+    tensor.block_until_ready()
+
+  for k, v in init_data.items():
+    print(k)
+    print_info(v)
+
+  with catchtime():
+    t = exec({k: v for k, v in init_data.items()})
+    t.block_until_ready()
+  with catchtime():
+    t = exec(init_data)
+    t.block_until_ready()
+  print("out")
+  print_info(t)
+
+def exp06_with_shards(shards):
+  out = block()
+
+  @jax.jit
+  def exec(tensors):
+    graph_exec(out, tensors)
+    return tensors[out.name]
+
+  init_data = graph_init_zeros_sharded(out, shards)
+  for tensor in init_data.values():
+    tensor.block_until_ready()
+
+  with catchtime():
+    t = exec({k: v for k, v in init_data.items()})
+    t.block_until_ready()
+  with catchtime() as timer:
+    t = exec(init_data)
+    t.block_until_ready()
+  return timer.time
+
+def exp07_which_block_input_sharding(nlocs):
+  ret = None
+  for shards in block_input_sharding_split_heads(nlocs, allofem = True):
+    t = exp06_with_shards(shards)
+    if ret is None or t < ret:
+      ret = t
+      print(shards, t)
+
+
